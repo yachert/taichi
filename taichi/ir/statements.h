@@ -899,6 +899,26 @@ class FuncCallStmt : public Stmt {
 };
 
 /**
+ * A reference to a variable.
+ */
+class ReferenceStmt : public Stmt {
+ public:
+  Stmt *var;
+  bool global_side_effect{false};
+
+  ReferenceStmt(Stmt *var) : var(var) {
+    TI_STMT_REG_FIELDS;
+  }
+
+  bool has_global_side_effect() const override {
+    return global_side_effect;
+  }
+
+  TI_STMT_DEF_FIELDS(ret_type, var);
+  TI_DEFINE_ACCEPT_AND_CLONE
+};
+
+/**
  * Exit the kernel or function with a return value.
  */
 class ReturnStmt : public Stmt {
@@ -1423,6 +1443,37 @@ class InternalFuncStmt : public Stmt {
   }
 
   TI_STMT_DEF_FIELDS(ret_type, func_name, args, with_runtime_context);
+  TI_DEFINE_ACCEPT_AND_CLONE
+};
+
+class Texture;
+
+class TexturePtrStmt : public Stmt {
+ public:
+  Stmt *arg_load_stmt{nullptr};
+
+  explicit TexturePtrStmt(Stmt *stmt) : arg_load_stmt(stmt) {
+    TI_STMT_REG_FIELDS;
+  }
+
+  TI_STMT_DEF_FIELDS(arg_load_stmt);
+  TI_DEFINE_ACCEPT_AND_CLONE
+};
+
+class TextureOpStmt : public Stmt {
+ public:
+  TextureOpType op;
+  Stmt *texture_ptr;
+  std::vector<Stmt *> args;
+
+  explicit TextureOpStmt(TextureOpType op,
+                         Stmt *texture_ptr,
+                         const std::vector<Stmt *> &args)
+      : op(op), texture_ptr(texture_ptr), args(args) {
+    TI_STMT_REG_FIELDS;
+  }
+
+  TI_STMT_DEF_FIELDS(op, texture_ptr, args);
   TI_DEFINE_ACCEPT_AND_CLONE
 };
 

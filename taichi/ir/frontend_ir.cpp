@@ -121,8 +121,17 @@ void ArgLoadExpression::type_check(CompileConfig *) {
 }
 
 void ArgLoadExpression::flatten(FlattenContext *ctx) {
-  auto arg_load = std::make_unique<ArgLoadStmt>(arg_id, dt);
+  auto arg_load = std::make_unique<ArgLoadStmt>(arg_id, dt, is_ptr);
   ctx->push_back(std::move(arg_load));
+  stmt = ctx->back_stmt();
+}
+
+void TexturePtrExpression::type_check(CompileConfig *config) {
+}
+
+void TexturePtrExpression::flatten(FlattenContext *ctx) {
+  ctx->push_back<ArgLoadStmt>(arg_id, PrimitiveType::f32, true);
+  ctx->push_back<TexturePtrStmt>(ctx->back_stmt());
   stmt = ctx->back_stmt();
 }
 
@@ -197,6 +206,22 @@ void BinaryOpExpression::type_check(CompileConfig *config) {
     ret_type = PrimitiveType::i32;
     return;
   }
+  if (is_shift_op(type)) {
+    ret_type = lhs_type;
+    return;
+  }
+
+  // Some backends such as vulkan doesn't support fp64
+  // Try not promoting to fp64 unless neccessary
+  if (type == BinaryOpType::atan2) {
+    if (lhs_type == PrimitiveType::f64 || rhs_type == PrimitiveType::f64) {
+      ret_type = PrimitiveType::f64;
+    } else {
+      ret_type = PrimitiveType::f32;
+    }
+    return;
+  }
+
   if (type == BinaryOpType::truediv) {
     auto default_fp = config->default_fp;
     if (!is_real(lhs_type)) {
@@ -247,6 +272,37 @@ void BinaryOpExpression::flatten(FlattenContext *ctx) {
   stmt = ctx->back_stmt();
 }
 
+void make_ifte(Expression::FlattenContext *ctx,
+               DataType ret_type,
+               Expr cond,
+               Expr true_val,
+               Expr false_val) {
+  auto result = ctx->push_back<AllocaStmt>(ret_type);
+  flatten_rvalue(cond, ctx);
+  auto if_stmt = ctx->push_back<IfStmt>(cond->stmt);
+
+  Expression::FlattenContext lctx;
+  lctx.current_block = ctx->current_block;
+  flatten_rvalue(true_val, &lctx);
+  lctx.push_back<LocalStoreStmt>(result, true_val->stmt);
+
+  Expression::FlattenContext rctx;
+  rctx.current_block = ctx->current_block;
+  flatten_rvalue(false_val, &rctx);
+  rctx.push_back<LocalStoreStmt>(result, false_val->stmt);
+
+  auto true_block = std::make_unique<Block>();
+  true_block->set_statements(std::move(lctx.stmts));
+  if_stmt->set_true_statements(std::move(true_block));
+
+  auto false_block = std::make_unique<Block>();
+  false_block->set_statements(std::move(rctx.stmts));
+  if_stmt->set_false_statements(std::move(false_block));
+
+  ctx->push_back<LocalLoadStmt>(LocalAddress(result, 0));
+  return;
+}
+
 void TernaryOpExpression::type_check(CompileConfig *) {
   TI_ASSERT_TYPE_CHECKED(op1);
   TI_ASSERT_TYPE_CHECKED(op2);
@@ -260,8 +316,9 @@ void TernaryOpExpression::type_check(CompileConfig *) {
                     ternary_type_name(type), op1->ret_type->to_string(),
                     op2->ret_type->to_string(), op3->ret_type->to_string()));
   };
-  if (!is_integral(op1_type) || !op2_type->is<PrimitiveType>() ||
-      !op3_type->is<PrimitiveType>())
+  if (op1_type != PrimitiveType::i32)
+    error();
+  if (!op2_type->is<PrimitiveType>() || !op3_type->is<PrimitiveType>())
     error();
   ret_type = promoted_type(op2_type, op3_type);
 }
@@ -269,12 +326,17 @@ void TernaryOpExpression::type_check(CompileConfig *) {
 void TernaryOpExpression::flatten(FlattenContext *ctx) {
   // if (stmt)
   //  return;
-  flatten_rvalue(op1, ctx);
-  flatten_rvalue(op2, ctx);
-  flatten_rvalue(op3, ctx);
-  ctx->push_back(
-      std::make_unique<TernaryOpStmt>(type, op1->stmt, op2->stmt, op3->stmt));
+  if (type == TernaryOpType::select) {
+    flatten_rvalue(op1, ctx);
+    flatten_rvalue(op2, ctx);
+    flatten_rvalue(op3, ctx);
+    ctx->push_back(
+        std::make_unique<TernaryOpStmt>(type, op1->stmt, op2->stmt, op3->stmt));
+  } else if (type == TernaryOpType::ifte) {
+    make_ifte(ctx, ret_type, op1, op2, op3);
+  }
   stmt = ctx->back_stmt();
+  stmt->tb = tb;
 }
 
 void InternalFuncCallExpression::type_check(CompileConfig *) {
@@ -312,9 +374,7 @@ void GlobalVariableExpression::flatten(FlattenContext *ctx) {
 
 void GlobalPtrExpression::type_check(CompileConfig *) {
   // Currently, dimension compatibility check happens in Python
-  if (snode != nullptr) {
-    ret_type = snode->dt;
-  } else if (var.is<GlobalVariableExpression>()) {
+  if (var.is<GlobalVariableExpression>()) {
     ret_type =
         var.cast<GlobalVariableExpression>()->snode->dt->get_compute_type();
   } else if (var.is<ExternalTensorExpression>()) {
@@ -337,10 +397,7 @@ void GlobalPtrExpression::flatten(FlattenContext *ctx) {
   std::vector<Stmt *> index_stmts;
   std::vector<int> offsets;
   SNode *snode = nullptr;
-  if (this->snode != nullptr) {
-    snode = this->snode;
-  }
-  if (bool(var) && var.is<GlobalVariableExpression>()) {
+  if (var.is<GlobalVariableExpression>()) {
     snode = var.cast<GlobalVariableExpression>()->snode;
     offsets = snode->index_offsets;
   }
@@ -462,10 +519,8 @@ void AtomicOpExpression::type_check(CompileConfig *) {
   };
   if (!val->ret_type->is<PrimitiveType>())
     error();
-  if (auto cit = dest->ret_type->cast<CustomIntType>()) {
-    ret_type = cit->get_compute_type();
-  } else if (auto cft = dest->ret_type->cast<CustomFloatType>()) {
-    ret_type = cft->get_compute_type();
+  if (is_quant(dest->ret_type)) {
+    ret_type = dest->ret_type->get_compute_type();
   } else if (dest->ret_type->is<PrimitiveType>()) {
     ret_type = dest->ret_type;
   } else {
@@ -476,21 +531,28 @@ void AtomicOpExpression::type_check(CompileConfig *) {
 void AtomicOpExpression::flatten(FlattenContext *ctx) {
   // replace atomic sub with negative atomic add
   if (op_type == AtomicOpType::sub) {
+    if (val->ret_type != ret_type) {
+      val.set(Expr::make<UnaryOpExpression>(UnaryOpType::cast_value, val,
+                                            ret_type));
+    }
+
     val.set(Expr::make<UnaryOpExpression>(UnaryOpType::neg, val));
     op_type = AtomicOpType::add;
   }
   // expand rhs
-  auto expr = val;
-  flatten_rvalue(expr, ctx);
+  flatten_rvalue(val, ctx);
+  auto src_val = val->stmt;
   if (dest.is<IdExpression>()) {  // local variable
     // emit local store stmt
     auto alloca = ctx->current_block->lookup_var(dest.cast<IdExpression>()->id);
-    ctx->push_back<AtomicOpStmt>(op_type, alloca, expr->stmt);
+    ctx->push_back<AtomicOpStmt>(op_type, alloca, src_val);
   } else {
     TI_ASSERT(dest.is<GlobalPtrExpression>() ||
-              dest.is<TensorElementExpression>());
+              dest.is<TensorElementExpression>() ||
+              (dest.is<ArgLoadExpression>() &&
+               dest.cast<ArgLoadExpression>()->is_ptr));
     flatten_lvalue(dest, ctx);
-    ctx->push_back<AtomicOpStmt>(op_type, dest->stmt, expr->stmt);
+    ctx->push_back<AtomicOpStmt>(op_type, dest->stmt, src_val);
   }
   stmt = ctx->back_stmt();
   stmt->tb = tb;
@@ -531,6 +593,52 @@ void SNodeOpExpression::flatten(FlattenContext *ctx) {
     TI_ERROR_IF(data_type_size(snode->ch[0]->dt) != 4,
                 "ti.append only works on i32/f32 nodes.");
   }
+  stmt = ctx->back_stmt();
+}
+
+void TextureOpExpression::type_check(CompileConfig *config) {
+  if (op == TextureOpType::sample_lod) {
+    // UV, Lod
+    TI_ASSERT_INFO(args.size() == 3,
+                   "Invalid number of args for sample_lod Texture op");
+    TI_ASSERT_TYPE_CHECKED(args[0]);
+    TI_ASSERT_TYPE_CHECKED(args[1]);
+    TI_ASSERT_TYPE_CHECKED(args[2]);
+    if (args[0].get_ret_type() != PrimitiveType::f32 ||
+        args[1].get_ret_type() != PrimitiveType::f32 ||
+        args[2].get_ret_type() != PrimitiveType::f32) {
+      throw TaichiTypeError(
+          fmt::format("All arguments to sample_lod Texture op must be FP32"));
+    }
+  } else if (op == TextureOpType::fetch_texel) {
+    // index, int LOD
+    TI_ASSERT_INFO(args.size() == 3,
+                   "Invalid number of args for fetch_texel Texture op");
+    TI_ASSERT_TYPE_CHECKED(args[0]);
+    TI_ASSERT_TYPE_CHECKED(args[1]);
+    TI_ASSERT_TYPE_CHECKED(args[2]);
+    if (args[0].get_ret_type() != PrimitiveType::i32 ||
+        args[1].get_ret_type() != PrimitiveType::i32 ||
+        args[2].get_ret_type() != PrimitiveType::i32) {
+      throw TaichiTypeError(
+          fmt::format("All arguments to fetch_texel Texture op must be i32"));
+    }
+  } else {
+    TI_ERROR("Invalid TextureOpType");
+  }
+  ret_type =
+      TypeFactory::get_instance().get_pointer_type(PrimitiveType::f32,
+                                                   /*is_bit_pointer=*/false);
+}
+
+void TextureOpExpression::flatten(FlattenContext *ctx) {
+  flatten_rvalue(texture_ptr, ctx);
+  std::vector<Stmt *> arg_stmts;
+  for (Expr &arg : args.exprs) {
+    flatten_rvalue(arg, ctx);
+    arg_stmts.push_back(arg->stmt);
+  }
+  ctx->push_back<TextureOpStmt>(op, texture_ptr->stmt, arg_stmts);
   stmt = ctx->back_stmt();
 }
 
@@ -617,6 +725,16 @@ void MeshIndexConversionExpression::type_check(CompileConfig *) {
 void MeshIndexConversionExpression::flatten(FlattenContext *ctx) {
   flatten_rvalue(idx, ctx);
   ctx->push_back<MeshIndexConversionStmt>(mesh, idx_type, idx->stmt, conv_type);
+  stmt = ctx->back_stmt();
+}
+
+void ReferenceExpression::type_check(CompileConfig *) {
+  ret_type = var->ret_type;
+}
+
+void ReferenceExpression::flatten(FlattenContext *ctx) {
+  flatten_lvalue(var, ctx);
+  ctx->push_back<ReferenceStmt>(var->stmt);
   stmt = ctx->back_stmt();
 }
 
@@ -940,6 +1058,9 @@ void flatten_rvalue(Expr ptr, Expression::FlattenContext *ctx) {
     else {
       TI_NOT_IMPLEMENTED
     }
+  } else if (ptr.is<ArgLoadExpression>() &&
+             ptr.cast<ArgLoadExpression>()->is_ptr) {
+    flatten_global_load(ptr, ctx);
   }
 }
 

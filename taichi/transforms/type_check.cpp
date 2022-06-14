@@ -23,7 +23,7 @@ class TypeCheck : public IRVisitor {
                          Stmt *&val,
                          const std::string &stmt_name) {
     auto dst_type = dst->ret_type.ptr_removed();
-    if (dst_type->is<CustomIntType>() || dst_type->is<CustomFloatType>()) {
+    if (is_quant(dst_type)) {
       // We force the value type to be the compute_type of the bit pointer.
       // Casting from compute_type to physical_type is handled in codegen.
       dst_type = dst_type->get_compute_type();
@@ -123,11 +123,7 @@ class TypeCheck : public IRVisitor {
 
   void visit(GlobalLoadStmt *stmt) override {
     auto pointee_type = stmt->src->ret_type.ptr_removed();
-    if (auto bit_struct = pointee_type->cast<BitStructType>()) {
-      stmt->ret_type = bit_struct->get_physical_type();
-    } else {
-      stmt->ret_type = pointee_type->get_compute_type();
-    }
+    stmt->ret_type = pointee_type->get_compute_type();
   }
 
   void visit(SNodeOpStmt *stmt) override {
@@ -244,7 +240,33 @@ class TypeCheck : public IRVisitor {
     return stmt;
   }
 
+  void insert_shift_op_assertion_before(Stmt *stmt, Stmt *lhs, Stmt *rhs) {
+    int rhs_limit = data_type_bits(lhs->ret_type);
+    auto const_stmt =
+        Stmt::make<ConstStmt>(TypedConstant(rhs->ret_type, rhs_limit));
+    auto cond_stmt =
+        Stmt::make<BinaryOpStmt>(BinaryOpType::cmp_le, rhs, const_stmt.get());
+
+    std::string msg =
+        "Detected overflow for bit_shift_op with rhs = %d, exceeding limit of "
+        "%d.";
+    std::vector<Stmt *> args = {rhs, const_stmt.get()};
+    auto assert_stmt =
+        Stmt::make<AssertStmt>(cond_stmt.get(), msg, std::move(args));
+
+    const_stmt->accept(this);
+    cond_stmt->accept(this);
+    assert_stmt->accept(this);
+
+    stmt->insert_before_me(std::move(const_stmt));
+    stmt->insert_before_me(std::move(cond_stmt));
+    stmt->insert_before_me(std::move(assert_stmt));
+  }
+
   void cast(Stmt *&val, DataType dt) {
+    if (val->ret_type == dt)
+      return;
+
     auto cast_stmt = insert_type_cast_after(val, val, dt);
     val = cast_stmt;
   }
@@ -278,16 +300,42 @@ class TypeCheck : public IRVisitor {
       stmt->op_type = BinaryOpType::div;
     }
 
+    // Some backends such as vulkan doesn't support fp64
+    // Always promote to fp32 unless neccessary
+    if (stmt->op_type == BinaryOpType::atan2) {
+      if (stmt->rhs->ret_type == PrimitiveType::f64 ||
+          stmt->lhs->ret_type == PrimitiveType::f64) {
+        stmt->ret_type = PrimitiveType::f64;
+        cast(stmt->rhs, PrimitiveType::f64);
+        cast(stmt->lhs, PrimitiveType::f64);
+      } else {
+        stmt->ret_type = PrimitiveType::f32;
+        cast(stmt->rhs, PrimitiveType::f32);
+        cast(stmt->lhs, PrimitiveType::f32);
+      }
+    }
+
     if (stmt->lhs->ret_type != stmt->rhs->ret_type) {
-      auto promote_custom_int_type = [&](Stmt *stmt, Stmt *hs) {
-        if (auto cit = hs->ret_type->cast<CustomIntType>()) {
-          return insert_type_cast_before(stmt, hs, cit->get_compute_type());
+      DataType ret_type;
+      if (is_shift_op(stmt->op_type)) {
+        // shift_ops does not follow the same type promotion rule as numerical
+        // ops numerical ops: u8 + i32 = i32 shift_ops:     u8 << i32 = u8
+        // (return dtype follows that of the lhs)
+        //
+        // In the above example, while truncating rhs(i32) to u8 risks an
+        // overflow, the runtime value of rhs is very likely less than 8
+        // (otherwise meaningless). Nevertheless, we insert an AssertStmt here
+        // to warn user of this potential overflow.
+        ret_type = stmt->lhs->ret_type;
+
+        // Insert AssertStmt
+        if (config_.debug) {
+          insert_shift_op_assertion_before(stmt, stmt->lhs, stmt->rhs);
         }
-        return hs;
-      };
-      stmt->lhs = promote_custom_int_type(stmt, stmt->lhs);
-      stmt->rhs = promote_custom_int_type(stmt, stmt->rhs);
-      auto ret_type = promoted_type(stmt->lhs->ret_type, stmt->rhs->ret_type);
+      } else {
+        ret_type = promoted_type(stmt->lhs->ret_type, stmt->rhs->ret_type);
+      }
+
       if (ret_type != stmt->lhs->ret_type) {
         // promote lhs
         auto cast_stmt = insert_type_cast_before(stmt, stmt->lhs, ret_type);
@@ -490,6 +538,11 @@ class TypeCheck : public IRVisitor {
 
   void visit(BitStructStoreStmt *stmt) override {
     // do nothing
+  }
+
+  void visit(ReferenceStmt *stmt) override {
+    stmt->ret_type = stmt->var->ret_type;
+    stmt->ret_type.set_is_pointer(true);
   }
 };
 
