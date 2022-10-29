@@ -24,7 +24,7 @@ There are two ways to import a NumPy array `arr` to the Taichi scope:
 To import data from a NumPy array to a Taichi field, first make sure that the field and the array have the same shape:
 
 ```python
-x = ti.field(float, shape=(3, 3))
+x = ti.field(ti.i32, shape=(3, 3))
 a = np.arange(9).reshape(3, 3).astype(np.int32)
 x.from_numpy(a)
 print(x)
@@ -163,7 +163,7 @@ def test(a: ti.types.ndarray()):
         for j in range(a.shape[1]):
             a[i, j] = i + j
 
-test()
+test(a)
 print(a)
 ```
 
