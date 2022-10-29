@@ -56,7 +56,7 @@ Using `ti.ad.Tape()` is the easiest way to obtain a kernel that computes `dy/dx`
 
 1.  Enable `needs_grad=True` option when declaring fields involved in
     the derivative chain.
-2.  Use context manager `with ti.ad.Tape(y):` to capture the kernel invocations which you want to automatically differentiate.
+2.  Use context manager with `ti.ad.Tape(y)`: to capture the kernel invocations which you want to automatically differentiate.
 3.  Now `dy/dx` value at current `x` is available at `x.grad[None]`.
 
 The following code snippet explains the steps above:
